@@ -6,8 +6,10 @@ import unittest
 from app.imposition import (
     BindingCheckError,
     ChapterTooLargeError,
+    _ceil_to_multiple_of_four,
     build_binding_check,
     build_chapter_imposition,
+    build_color_plan,
     build_imposition,
     build_manual_duplex,
     build_reprint,
@@ -329,6 +331,255 @@ class TestBuildChapterImposition(unittest.TestCase):
     def test_single_chapter_too_large_raises(self):
         with self.assertRaises(ChapterTooLargeError):
             build_chapter_imposition([2, 9], max_sheets_per_booklet=2)
+
+
+class TestBuildColorPlan(unittest.TestCase):
+    """彩印 / 黑白混合计费的最优分册。"""
+
+    def test_no_color_ranges_all_bw(self):
+        # 8 页容量 8：无彩色页时全部黑白；[8] 与 [4,4] 同为 2 张纸，
+        # 册数更少 -> 选一册方案
+        result = build_color_plan(8, 2, None, 50, 10)
+        self.assertEqual(result["total_pages"], 8)
+        self.assertEqual(result["max_sheets_per_booklet"], 2)
+        self.assertEqual(result["color_ranges"], [])
+        self.assertEqual(result["booklet_count"], 1)
+        self.assertEqual(result["total_sheets"], 2)
+        self.assertEqual(result["color_sheet_count"], 0)
+        self.assertEqual(result["bw_sheet_count"], 2)
+        self.assertEqual(result["total_cost"], 20)
+        booklet = result["booklets"][0]
+        self.assertEqual((booklet["start_page"], booklet["end_page"]), (1, 8))
+        self.assertEqual(booklet["cost"], 20)
+        self.assertEqual(
+            [s["print_mode"] for s in booklet["sheets"]], ["bw", "bw"]
+        )
+        self.assertEqual([s["price"] for s in booklet["sheets"]], [10, 10])
+
+    def test_empty_color_ranges_equivalent_to_none(self):
+        empty = build_color_plan(8, 2, [], 50, 10)
+        none = build_color_plan(8, 2, None, 50, 10)
+        self.assertEqual(empty["total_cost"], none["total_cost"])
+        self.assertEqual(
+            [(b["start_page"], b["end_page"]) for b in empty["booklets"]],
+            [(b["start_page"], b["end_page"]) for b in none["booklets"]],
+        )
+        self.assertEqual(empty["color_ranges"], [])
+
+    def test_color_sheet_detection_within_one_booklet(self):
+        # 16 页 1 册 4 张纸，彩色 3..6 -> 第 2、3 张纸彩印（彩印更便宜时不拆册）
+        result = build_color_plan(16, 4, [(3, 6)], 5, 10)
+        self.assertEqual(result["booklet_count"], 1)
+        booklet = result["booklets"][0]
+        self.assertEqual(
+            [s["print_mode"] for s in booklet["sheets"]],
+            ["bw", "color", "color", "bw"],
+        )
+        self.assertEqual(booklet["color_sheet_count"], 2)
+        self.assertEqual(booklet["cost"], 2 * 5 + 2 * 10)
+        self.assertEqual(result["total_cost"], 30)
+        self.assertEqual(result["color_sheet_count"], 2)
+        self.assertEqual(result["bw_sheet_count"], 2)
+        # 每张纸给出单价与正反面页码
+        self.assertEqual(booklet["sheets"][1]["price"], 5)
+        self.assertEqual(booklet["sheets"][1]["front"], {"left": 14, "right": 3})
+        self.assertEqual(booklet["sheets"][1]["back"], {"left": 4, "right": 13})
+
+    def test_cost_driven_split_isolates_color_pages(self):
+        # 16 页、彩色 3..6、彩印 50 / 黑白 10：
+        # 一册方案 2 彩 2 黑白 = 120；[1..8][9..16] 把彩色页集中到 1 张纸，
+        # 1 彩 3 黑白 = 80 -> 拆册更省
+        result = build_color_plan(16, 4, [(3, 6)], 50, 10)
+        self.assertEqual(result["total_cost"], 80)
+        self.assertEqual(result["booklet_count"], 2)
+        self.assertEqual(
+            [(b["start_page"], b["end_page"]) for b in result["booklets"]],
+            [(1, 8), (9, 16)],
+        )
+        first, second = result["booklets"]
+        self.assertEqual([s["print_mode"] for s in first["sheets"]], ["bw", "color"])
+        self.assertEqual(first["cost"], 10 + 50)
+        self.assertEqual([s["print_mode"] for s in second["sheets"]], ["bw", "bw"])
+        self.assertEqual(second["cost"], 20)
+        # 总费用等于各册费用之和
+        self.assertEqual(
+            result["total_cost"], sum(b["cost"] for b in result["booklets"])
+        )
+
+    def test_cheaper_color_price_favors_more_color_sheets(self):
+        # 8 页、彩色 {1, 8}、彩印 5 / 黑白 10：
+        # [8] 为 1 彩 1 黑白 = 15；[4,4] 两册各 1 彩 = 10 -> 选 [4,4]
+        result = build_color_plan(8, 2, [(1, 1), (8, 8)], 5, 10)
+        self.assertEqual(result["total_cost"], 10)
+        self.assertEqual(
+            [(b["start_page"], b["end_page"]) for b in result["booklets"]],
+            [(1, 4), (5, 8)],
+        )
+        self.assertEqual(result["color_sheet_count"], 2)
+
+    def test_overlapping_ranges_charged_once(self):
+        # 交叠区间取并集：[(1,4),(3,6)] 与 [(1,6)] 完全等价
+        merged = build_color_plan(16, 4, [(1, 6)], 5, 10)
+        overlapped = build_color_plan(16, 4, [(1, 4), (3, 6)], 5, 10)
+        self.assertEqual(overlapped["total_cost"], merged["total_cost"])
+        self.assertEqual(
+            [s["print_mode"] for b in overlapped["booklets"] for s in b["sheets"]],
+            [s["print_mode"] for b in merged["booklets"] for s in b["sheets"]],
+        )
+        # 并集 1..6 -> 前三张纸彩印，彩印更便宜 -> 一册方案 3 彩 1 黑白 = 25
+        self.assertEqual(overlapped["total_cost"], 25)
+        self.assertEqual(overlapped["color_sheet_count"], 3)
+        self.assertEqual(
+            overlapped["color_ranges"],
+            [{"start_page": 1, "end_page": 4}, {"start_page": 3, "end_page": 6}],
+        )
+
+    def test_blank_padding_pages_never_color(self):
+        # 5 页、彩色第 5 页：一册补齐到 8 页，外纸只有 1、2 两个非空页 -> 黑白；
+        # 内纸含第 5 页 -> 彩印（补白页不计费）
+        result = build_color_plan(5, 10, [(5, 5)], 50, 10)
+        self.assertEqual(result["booklet_count"], 1)
+        booklet = result["booklets"][0]
+        self.assertEqual(booklet["blank_pages"], 3)
+        self.assertEqual(
+            [s["print_mode"] for s in booklet["sheets"]], ["bw", "color"]
+        )
+        self.assertEqual(result["total_cost"], 60)
+        # 补白仍以 None 表示
+        self.assertIsNone(booklet["sheets"][0]["front"]["left"])
+        self.assertIsNone(booklet["sheets"][0]["back"]["right"])
+
+    def test_tie_breaks_sheets_then_booklets_then_end_pages(self):
+        # 6 页、每册最多 1 张纸（容量 4 页）、无彩色页：
+        # [1..2][3..6]、[1..3][4..6]、[1..4][5..6] 同为 2 张纸、2 册，
+        # 末页序列 (2,6) < (3,6) < (4,6) -> 选 [1..2][3..6]
+        result = build_color_plan(6, 1, None, 50, 10)
+        self.assertEqual(result["total_sheets"], 2)
+        self.assertEqual(result["booklet_count"], 2)
+        self.assertEqual(
+            [(b["start_page"], b["end_page"]) for b in result["booklets"]],
+            [(1, 2), (3, 6)],
+        )
+
+    def test_every_original_page_appears_exactly_once(self):
+        for total, cap, ranges in (
+            (1, 1, None),
+            (5, 2, [(2, 4)]),
+            (17, 2, [(1, 17)]),
+            (33, 3, [(5, 9), (8, 12), (30, 33)]),
+            (100, 4, [(1, 50)]),
+        ):
+            result = build_color_plan(total, cap, ranges, 7, 3)
+            pages = []
+            for booklet in result["booklets"]:
+                for sheet in booklet["sheets"]:
+                    for side in ("front", "back"):
+                        for pos in ("left", "right"):
+                            value = sheet[side][pos]
+                            if value is not None:
+                                pages.append(value)
+            self.assertEqual(
+                sorted(pages),
+                list(range(1, total + 1)),
+                f"total={total}, cap={cap}, ranges={ranges}",
+            )
+            # 费用与纸张数账目自洽
+            self.assertEqual(
+                result["total_cost"], sum(b["cost"] for b in result["booklets"])
+            )
+            self.assertEqual(
+                result["total_sheets"],
+                result["color_sheet_count"] + result["bw_sheet_count"],
+            )
+
+    def test_all_pages_color(self):
+        result = build_color_plan(8, 2, [(1, 8)], 50, 10)
+        self.assertEqual(result["color_sheet_count"], result["total_sheets"])
+        self.assertEqual(result["bw_sheet_count"], 0)
+        self.assertEqual(result["total_cost"], 2 * 50)
+
+    def test_summary_fields_echo_request(self):
+        result = build_color_plan(10, 3, [(2, 3)], 40, 8)
+        self.assertEqual(result["total_pages"], 10)
+        self.assertEqual(result["max_sheets_per_booklet"], 3)
+        self.assertEqual(result["color_price_per_sheet"], 40)
+        self.assertEqual(result["bw_price_per_sheet"], 8)
+        self.assertEqual(
+            result["color_ranges"], [{"start_page": 2, "end_page": 3}]
+        )
+
+    def test_matches_brute_force_enumeration(self):
+        # 小规模随机用例与穷举所有合法分册的暴力解交叉验证：
+        # (总费用, 总纸张数, 册数, 末页页码序列) 必须一致。
+        import random
+
+        def brute(total, capacity, color_pages, color_price, bw_price):
+            def sheet_cost(start, end):
+                original = end - start + 1
+                padded = _ceil_to_multiple_of_four(original)
+                sheets = padded // 4
+                color_sheets = 0
+                for k in range(sheets):
+                    positions = (
+                        padded - 2 * k, 1 + 2 * k, 2 + 2 * k, padded - 1 - 2 * k,
+                    )
+                    if any(
+                        p <= original and (start + p - 1) in color_pages
+                        for p in positions
+                    ):
+                        color_sheets += 1
+                return (
+                    color_sheets * color_price + (sheets - color_sheets) * bw_price,
+                    sheets,
+                )
+
+            best = None
+
+            def rec(start, ends, cost, sheets):
+                nonlocal best
+                if start > total:
+                    key = (cost, sheets, len(ends), tuple(ends))
+                    if best is None or key < best:
+                        best = key
+                    return
+                for end in range(start, min(total, start + capacity - 1) + 1):
+                    c, s = sheet_cost(start, end)
+                    rec(end + 1, ends + [end], cost + c, sheets + s)
+
+            rec(1, [], 0, 0)
+            return best
+
+        rng = random.Random(20260926)
+        for total in range(1, 11):
+            for max_sheets in (1, 2, 3):
+                for _ in range(20):
+                    ranges = []
+                    for _ in range(rng.randint(0, 3)):
+                        a = rng.randint(1, total)
+                        ranges.append((a, rng.randint(a, total)))
+                    color_price = rng.randint(1, 9)
+                    bw_price = rng.randint(1, 9)
+                    color_pages = {
+                        p for a, b in ranges for p in range(a, b + 1)
+                    }
+                    expected = brute(
+                        total, 4 * max_sheets, color_pages, color_price, bw_price
+                    )
+                    result = build_color_plan(
+                        total, max_sheets, ranges, color_price, bw_price
+                    )
+                    got = (
+                        result["total_cost"],
+                        result["total_sheets"],
+                        result["booklet_count"],
+                        tuple(b["end_page"] for b in result["booklets"]),
+                    )
+                    self.assertEqual(
+                        got,
+                        expected,
+                        f"total={total}, max_sheets={max_sheets}, "
+                        f"ranges={ranges}, prices=({color_price}, {bw_price})",
+                    )
 
 
 class TestBuildReprint(unittest.TestCase):

@@ -18,6 +18,12 @@
 可合册，在每册页数不超过 ``4 * max_sheets_per_booklet`` 的所有方案中依次最小化
 总纸张数与册数，并以各册结束章节序号序列的字典序裁决并列。
 
+彩印 / 黑白混合计费的最优分册（``build_color_plan``）：原稿连续有序分册，
+每册至少一页且不超容量，每册末尾补白到 4 的倍数后沿用同一拼版。纸上任一
+非空页属于彩色页区间（若干闭区间的并集，交叠不重复计费）即整纸按彩印计费，
+否则按黑白计费。在所有合法分册方案中依次最小化：总费用、总纸张数、册数，
+并以各册末页页码序列的字典序裁决并列。
+
 手工双面打印清单（``build_manual_duplex``）：不支持自动双面打印时，每册纸分两轮
 手工送纸——
 
@@ -329,6 +335,159 @@ def build_chapter_imposition(
         "booklet_count": len(booklets),
         "total_sheets": sum(b.sheet_count for b in booklets),
         "total_blank_pages": sum(b.blank_pages for b in booklets),
+        "booklets": result_booklets,
+    }
+
+
+def build_color_plan(
+    total_pages: int,
+    max_sheets_per_booklet: int,
+    color_ranges: Iterable[tuple[int, int]] | None,
+    color_price_per_sheet: int,
+    bw_price_per_sheet: int,
+) -> dict:
+    """彩印 / 黑白混合计费的最优分册方案。
+
+    原稿连续有序分册：每册至少一页、至多 ``4 * max_sheets_per_booklet`` 页，
+    每册末尾补白到 4 的倍数后沿用骑马钉拼版。``color_ranges`` 为若干
+    ``(start_page, end_page)`` 闭区间（1-based，可为 ``None`` 或空列表），
+    调用方（schema 层）需已保证区间非倒置、未越界；交叠区间取并集，不重复计费。
+
+    计费规则：一张纸上任一非空页（补白页除外）属于彩色页并集，整纸按彩印单价
+    计费，否则按黑白单价计费。在所有合法分册方案中依次最小化：
+
+    1. 总费用（分）；
+    2. 总纸张数；
+    3. 册数；
+    4. 各册末页页码（1-based）组成序列的字典序。
+
+    返回总费用与每册的页区间、费用，以及每张纸的印刷方式（``color`` / ``bw``）、
+    单价和正反面左右原稿页码（补白为 ``None``）。
+    """
+    ranges = list(color_ranges or [])
+    # 彩色页并集：交叠区间自然去重，同一页只影响一次计费判定。
+    is_color = [False] * (total_pages + 1)
+    for start, end in ranges:
+        for page in range(start, end + 1):
+            is_color[page] = True
+
+    capacity = 4 * max_sheets_per_booklet
+
+    def booklet_cost(start_page: int, end_page: int) -> tuple[int, int]:
+        """一册 [start_page, end_page] 的 (费用, 纸张数)。"""
+        original = end_page - start_page + 1
+        padded = _ceil_to_multiple_of_four(original)
+        sheets = padded // 4
+        color_sheets = 0
+        for k in range(sheets):
+            # 从外到内第 k 张纸的四个版面位置（补齐版面上的 1-based 编号）。
+            positions = (padded - 2 * k, 1 + 2 * k, 2 + 2 * k, padded - 1 - 2 * k)
+            if any(
+                p <= original and is_color[start_page + p - 1] for p in positions
+            ):
+                color_sheets += 1
+        return (
+            color_sheets * color_price_per_sheet
+            + (sheets - color_sheets) * bw_price_per_sheet,
+            sheets,
+        )
+
+    # 动态规划：best[i] 为前 i 页的最优 (总费用, 总纸张数, 册数, 末页页码序列)，
+    # 四者按字典序比较即对应上述依次最小化的择优目标（末页序列仅在前三项
+    # 相同、即序列等长时参与比较，元组字典序比较与题意一致）。
+    best: list[tuple[int, int, int, tuple[int, ...]] | None] = [None] * (
+        total_pages + 1
+    )
+    best[0] = (0, 0, 0, ())
+    for i in range(1, total_pages + 1):
+        # 末册覆盖 j+1..i，页数 i-j 不得超过容量。
+        for j in range(i - 1, max(0, i - capacity) - 1, -1):
+            prev = best[j]
+            if prev is None:
+                continue
+            cost, sheets = booklet_cost(j + 1, i)
+            candidate = (
+                prev[0] + cost,
+                prev[1] + sheets,
+                prev[2] + 1,
+                prev[3] + (i,),
+            )
+            if best[i] is None or candidate < best[i]:
+                best[i] = candidate
+
+    # 每册至少一页且容量为正，最优分册必然存在。
+    assert best[total_pages] is not None
+    total_cost, total_sheets, booklet_count, end_pages = best[total_pages]
+
+    booklets: list[BookletRange] = []
+    start = 1
+    for index, end in enumerate(end_pages):
+        booklets.append(
+            BookletRange(
+                index=index,
+                start_page=start,
+                end_page=end,
+                padded_pages=_ceil_to_multiple_of_four(end - start + 1),
+            )
+        )
+        start = end + 1
+
+    result_booklets: list[dict] = []
+    total_color_sheets = 0
+    for booklet in booklets:
+        sheets_out: list[dict] = []
+        color_sheet_count = 0
+        booklet_cost_value = 0
+        for sheet in _build_booklet_sheets(booklet):
+            page_values = (
+                sheet["front"]["left"],
+                sheet["front"]["right"],
+                sheet["back"]["left"],
+                sheet["back"]["right"],
+            )
+            color = any(p is not None and is_color[p] for p in page_values)
+            price = color_price_per_sheet if color else bw_price_per_sheet
+            if color:
+                color_sheet_count += 1
+            booklet_cost_value += price
+            sheets_out.append(
+                {
+                    "index": sheet["index"],
+                    "print_mode": "color" if color else "bw",
+                    "price": price,
+                    "front": sheet["front"],
+                    "back": sheet["back"],
+                }
+            )
+        total_color_sheets += color_sheet_count
+        result_booklets.append(
+            {
+                "index": booklet.index,
+                "start_page": booklet.start_page,
+                "end_page": booklet.end_page,
+                "original_pages": booklet.original_pages,
+                "padded_pages": booklet.padded_pages,
+                "blank_pages": booklet.blank_pages,
+                "sheet_count": booklet.sheet_count,
+                "color_sheet_count": color_sheet_count,
+                "cost": booklet_cost_value,
+                "sheets": sheets_out,
+            }
+        )
+
+    return {
+        "total_pages": total_pages,
+        "max_sheets_per_booklet": max_sheets_per_booklet,
+        "color_ranges": [
+            {"start_page": start, "end_page": end} for start, end in ranges
+        ],
+        "color_price_per_sheet": color_price_per_sheet,
+        "bw_price_per_sheet": bw_price_per_sheet,
+        "booklet_count": booklet_count,
+        "total_sheets": total_sheets,
+        "color_sheet_count": total_color_sheets,
+        "bw_sheet_count": total_sheets - total_color_sheets,
+        "total_cost": total_cost,
         "booklets": result_booklets,
     }
 
