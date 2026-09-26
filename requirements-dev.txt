@@ -1,0 +1,3 @@
+# 开发 / 测试依赖（API 测试需要 httpx 驱动 FastAPI TestClient）
+-r requirements.txt
+httpx>=0.27,<1.0
