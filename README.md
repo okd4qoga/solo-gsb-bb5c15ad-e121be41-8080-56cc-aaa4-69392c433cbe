@@ -22,6 +22,14 @@
 打印反面；支持指定**首轮出纸堆是否倒序回填**（倒序则第二轮反转纸张次序）以及
 回填时**沿短边 / 长边翻转**（长边交换反面左右版面，短边保持不变）。
 
+还可求解**彩印 / 黑白混合计费下总费用最小的分册方案**（`POST /api/v1/color-plan`）：
+输入总页数（1–200）、每册最多纸张数、可为空的彩色页闭区间列表，以及彩印、黑白
+每张纸的正整数单价（分）。原稿连续有序分册（每册至少 1 页且不超容量），每册末尾
+补白到 4 的倍数并沿用骑马钉拼版；**纸上任一非空页属于彩色区间即整纸按彩印计费**，
+否则按黑白计费（交叠区间不重复计费）。服务在所有合法分册中依次最小化
+**① 总费用 → ② 总纸张数 → ③ 册数**，并以 **④ 各册末页序列的字典序** 裁决并列，
+返回总费用及各册页区间、费用、每张纸的印刷方式与正反面页码。
+
 > 1 张纸正反两面共 4 个版面，因此骑马钉册的页数永远是 4 的倍数。
 
 ---
@@ -79,6 +87,7 @@ HOST_PORT=9000
 | 按章节分册拼版接口（POST） | `POST http://localhost:8000/api/v1/chapter-impose` |
 | 装订核对接口（POST） | `POST http://localhost:8000/api/v1/binding-check` |
 | 手工双面打印清单接口（POST） | `POST http://localhost:8000/api/v1/manual-duplex` |
+| 彩印分册方案接口（POST） | `POST http://localhost:8000/api/v1/color-plan` |
 
 ## 4. 接口说明
 
@@ -599,6 +608,127 @@ curl -i -X POST http://localhost:8000/api/v1/manual-duplex \
 }
 ```
 
+### `POST /api/v1/color-plan`（彩印 / 黑白混合计费的最低费用分册方案）
+
+在彩印、黑白每张纸单价不同（单位：分）时，选择**总费用最小**的分册方案。规则：
+
+- 原稿**连续有序分册**：每册至少 1 页、不超过 `4 × max_sheets_per_booklet` 页；
+  每册末尾补白到 4 的倍数，沿用骑马钉拼版（与 `/api/v1/impose` 一致）；
+- **计费**：纸上任一**非空页**属于彩色区间，整纸按彩印计费，否则按黑白计费；
+  补白页不参与判定；彩色区间允许交叠，**交叠不重复计费**；
+- **择优**：在所有合法分册中依次最小化 **① 总费用 → ② 总纸张数 → ③ 册数**，
+  并以 **④ 各册末页（`end_page`）序列的字典序**（小者优先）裁决并列。
+
+**请求体（JSON）**
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `total_pages` | 整数 | 必填，`1` 到 `200` | 原稿总页数 |
+| `max_sheets_per_booklet` | 整数 | 必填，正整数 `>= 1` | 每册最多纸张数（每册最多 `4 ×` 该值 个版面） |
+| `color_ranges` | 区间数组 | 可缺省 / `null` / 空数组 | 彩色原稿页闭区间列表，端点均包含，允许交叠 |
+| `color_ranges[].start_page` | 整数 | 必填，正整数 | 区间起始页（含），须 `<= end_page` |
+| `color_ranges[].end_page` | 整数 | 必填，正整数 | 区间结束页（含），须 `<= total_pages` |
+| `color_price_per_sheet` | 整数 | 必填，正整数 `>= 1` | 每张纸的彩印单价（分） |
+| `bw_price_per_sheet` | 整数 | 必填，正整数 `>= 1` | 每张纸的黑白印刷单价（分） |
+
+以下情况一律返回 **HTTP 400**：`total_pages` 不是 1–200 的整数、
+`max_sheets_per_booklet` 或任一单价不是正整数、区间倒置
+（`start_page > end_page`）、区间越界（`end_page > total_pages` 或端点 `< 1`）、
+区间项不是对象 / 缺端点、缺失必填字段或存在多余字段。
+
+请求示例（12 页、每册最多 2 张纸即 8 页；彩色 9–12 页；彩印 100 分 / 黑白 10 分每张纸）：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/color-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+        "total_pages": 12,
+        "max_sheets_per_booklet": 2,
+        "color_ranges": [{"start_page": 9, "end_page": 12}],
+        "color_price_per_sheet": 100,
+        "bw_price_per_sheet": 10
+      }'
+```
+
+响应示例（彩色 9–12 页单独成册：第 1 册 2 张黑白纸 20 分，第 2 册 1 张彩印纸
+100 分，总费用 120 分）：
+
+```json
+{
+  "total_pages": 12,
+  "max_sheets_per_booklet": 2,
+  "color_ranges": [{ "start_page": 9, "end_page": 12 }],
+  "color_price_per_sheet": 100,
+  "bw_price_per_sheet": 10,
+  "total_cost": 120,
+  "booklet_count": 2,
+  "total_sheets": 3,
+  "color_sheet_count": 1,
+  "booklets": [
+    {
+      "index": 0,
+      "start_page": 1,
+      "end_page": 8,
+      "original_pages": 8,
+      "padded_pages": 8,
+      "blank_pages": 0,
+      "sheet_count": 2,
+      "color_sheet_count": 0,
+      "cost": 20,
+      "sheets": [
+        { "index": 0, "print_mode": "bw", "front": { "left": 8, "right": 1 }, "back": { "left": 2, "right": 7 } },
+        { "index": 1, "print_mode": "bw", "front": { "left": 6, "right": 3 }, "back": { "left": 4, "right": 5 } }
+      ]
+    },
+    {
+      "index": 1,
+      "start_page": 9,
+      "end_page": 12,
+      "original_pages": 4,
+      "padded_pages": 4,
+      "blank_pages": 0,
+      "sheet_count": 1,
+      "color_sheet_count": 1,
+      "cost": 100,
+      "sheets": [
+        { "index": 0, "print_mode": "color", "front": { "left": 12, "right": 9 }, "back": { "left": 10, "right": 11 } }
+      ]
+    }
+  ]
+}
+```
+
+字段含义：
+
+- `total_cost`：最优方案总费用（分）；`booklets[].cost` 为各册费用（分）。
+- `booklets[].sheets[].print_mode`：每张纸的印刷方式，`"color"` 彩印 / `"bw"` 黑白；
+  `front` / `back` 为该纸正反面左右原稿页码（补白为 `null`），与拼版接口口径一致。
+- `color_sheet_count`：按彩印计费的纸张数（各册与总计）。
+
+错误响应示例（区间倒置）：
+
+```bash
+curl -i -X POST http://localhost:8000/api/v1/color-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+        "total_pages": 12,
+        "max_sheets_per_booklet": 2,
+        "color_ranges": [{"start_page": 5, "end_page": 3}],
+        "color_price_per_sheet": 100,
+        "bw_price_per_sheet": 10
+      }'
+```
+
+```json
+{
+  "error": "invalid_input",
+  "message": "输入参数校验失败：total_pages 必须是 1 到 200 之间的整数，max_sheets_per_booklet、color_price_per_sheet、bw_price_per_sheet 必须是正整数，color_ranges 必须是有效的彩色页区间列表（可缺省，区间不得倒置或越界）。",
+  "details": [
+    { "field": "color_ranges", "message": "彩色页区间不能倒置：start_page 必须小于等于 end_page。" }
+  ]
+}
+```
+
 ## 5. 拼版规则（打印与装订说明）
 
 对一册补齐到 `n` 页（`n` 为 4 的倍数）的小册子，从外到内第 `i` 张纸
@@ -625,6 +755,11 @@ curl -i -X POST http://localhost:8000/api/v1/manual-duplex \
 首轮按外到内打印正面；随后把出纸堆回填进纸口打印反面。倒序回填时第二轮纸张
 次序反转；沿长边翻转回填时交换反面左右版面，沿短边翻转时左右不变。
 
+**彩印分册方案**（`/api/v1/color-plan`）：原稿连续有序分册，每册至少 1 页且不超
+`4 × max_sheets_per_booklet` 页，每册末尾补白到 4 的倍数；纸上任一非空页属于
+彩色区间即整纸按彩印计费，否则按黑白计费（交叠区间不重复计费）。在所有合法
+分册中依次最小化总费用、总纸张数、册数，并以各册末页序列的字典序裁决并列。
+
 ## 6. 本地开发（不使用 Docker）
 
 ```bash
@@ -649,9 +784,9 @@ python -m unittest discover -s tests -v
 .
 ├── app/
 │   ├── __init__.py
-│   ├── imposition.py      # 分册 / 补齐 / 拼版核心算法 + 补印定位 + 按章节最优分册 + 装订核对 + 手工双面清单（纯标准库）
-│   ├── schemas.py         # Pydantic 请求与响应模型（正整数 / 受损区间 / 章节容量 / 装订核对 / 手工双面选项校验）
-│   └── main.py            # FastAPI 路由（拼版、补印、按章节拼版、装订核对、手工双面清单）与 400 错误处理
+│   ├── imposition.py      # 分册 / 补齐 / 拼版核心算法 + 补印定位 + 按章节最优分册 + 装订核对 + 手工双面清单 + 彩印最低费用分册（纯标准库）
+│   ├── schemas.py         # Pydantic 请求与响应模型（正整数 / 受损区间 / 章节容量 / 装订核对 / 手工双面选项 / 彩色区间与单价校验）
+│   └── main.py            # FastAPI 路由（拼版、补印、按章节拼版、装订核对、手工双面清单、彩印分册方案）与 400 错误处理
 ├── tests/
 │   ├── test_imposition.py # 核心算法单元测试
 │   └── test_api.py        # API 与非法输入测试

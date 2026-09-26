@@ -375,3 +375,108 @@ class ManualDuplexResponse(BaseModel):
     booklet_count: int = Field(..., description="分册数量。")
     total_sheets: int = Field(..., description="全部册合计用纸张数。")
     booklets: list[ManualDuplexBooklet]
+
+
+class ColorRange(BaseModel):
+    """一段彩色原稿页区间（端点均包含，1-based）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start_page: StrictInt = Field(..., ge=1, description="彩色区间起始页（含）。")
+    end_page: StrictInt = Field(..., ge=1, description="彩色区间结束页（含）。")
+
+
+class ColorPlanRequest(BaseModel):
+    """彩印分册方案请求。
+
+    ``color_ranges`` 可为空（缺省 / null / 空列表均视为无彩色页）；
+    字段定义顺序保证校验 ``color_ranges`` 时 ``total_pages`` 已就绪。
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    total_pages: StrictInt = Field(
+        ...,
+        ge=1,
+        le=200,
+        description="原稿总页数，必须是 1 到 200 之间的整数。",
+        examples=[12],
+    )
+    max_sheets_per_booklet: StrictInt = Field(
+        ...,
+        ge=1,
+        description="每册最多纸张数（1 张纸正反 4 个版面），必须为正整数。",
+        examples=[2],
+    )
+    color_ranges: list[ColorRange] | None = Field(
+        default=None,
+        description="彩色原稿页闭区间列表（可缺省、为 null 或空列表），端点均包含，允许交叠。",
+    )
+    color_price_per_sheet: StrictInt = Field(
+        ..., ge=1, description="每张纸的彩印单价（分），必须为正整数。", examples=[100]
+    )
+    bw_price_per_sheet: StrictInt = Field(
+        ...,
+        ge=1,
+        description="每张纸的黑白印刷单价（分），必须为正整数。",
+        examples=[10],
+    )
+
+    @field_validator("color_ranges")
+    @classmethod
+    def _validate_ranges(
+        cls, ranges: list[ColorRange] | None, info: ValidationInfo
+    ) -> list[ColorRange] | None:
+        if ranges is None:
+            return ranges
+        total_pages = info.data.get("total_pages")
+        for range_ in ranges:
+            if range_.start_page > range_.end_page:
+                raise PydanticCustomError(
+                    "reversed_range",
+                    "彩色页区间不能倒置：start_page 必须小于等于 end_page。",
+                )
+            # total_pages 自身非法（缺失 / 越界）时已有对应校验错误，跳过越界检查。
+            if total_pages is not None and range_.end_page > total_pages:
+                raise PydanticCustomError(
+                    "page_out_of_range",
+                    "彩色页区间越界：页码必须在 1 到 total_pages 之间。",
+                )
+        return ranges
+
+
+class ColorPlanSheet(BaseModel):
+    index: int = Field(..., description="纸张序号，0 为该册最外侧纸张。")
+    print_mode: Literal["color", "bw"] = Field(
+        ..., description='该张纸的印刷方式："color" 彩印 / "bw" 黑白。'
+    )
+    front: SidePages = Field(..., description="正面（朝外一面）左右页码。")
+    back: SidePages = Field(..., description="反面（朝内一面）左右页码。")
+
+
+class ColorPlanBooklet(BaseModel):
+    index: int = Field(..., description="分册序号，从 0 开始。")
+    start_page: int = Field(..., description="本册起始原稿页码（含）。")
+    end_page: int = Field(..., description="本册结束原稿页码（含，即本册末页）。")
+    original_pages: int = Field(..., description="本册原稿页数。")
+    padded_pages: int = Field(..., description="补齐后的版面页数（4 的倍数）。")
+    blank_pages: int = Field(..., description="补位空白页数。")
+    sheet_count: int = Field(..., description="本册实际用纸张数。")
+    color_sheet_count: int = Field(..., description="本册按彩印计费的纸张数。")
+    cost: int = Field(..., description="本册印刷费用（分）。")
+    sheets: list[ColorPlanSheet] = Field(..., description="纸张列表，从外到内。")
+
+
+class ColorPlanResponse(BaseModel):
+    total_pages: int
+    max_sheets_per_booklet: int
+    color_ranges: list[ColorRange] = Field(
+        ..., description="生效的彩色页区间（按提交顺序原样返回，可交叠）。"
+    )
+    color_price_per_sheet: int = Field(..., description="每张纸的彩印单价（分）。")
+    bw_price_per_sheet: int = Field(..., description="每张纸的黑白印刷单价（分）。")
+    total_cost: int = Field(..., description="最优分册方案的总费用（分）。")
+    booklet_count: int = Field(..., description="分册数量。")
+    total_sheets: int = Field(..., description="全部册合计用纸张数。")
+    color_sheet_count: int = Field(..., description="全部册合计彩印纸张数。")
+    booklets: list[ColorPlanBooklet]

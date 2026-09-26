@@ -8,12 +8,14 @@ from app.imposition import (
     ChapterTooLargeError,
     build_binding_check,
     build_chapter_imposition,
+    build_color_plan,
     build_imposition,
     build_manual_duplex,
     build_reprint,
     impose_padded_booklet,
     split_booklets,
     split_chapter_booklets,
+    split_color_plan_booklets,
 )
 
 
@@ -802,6 +804,113 @@ class TestMinimumSwapSteps(unittest.TestCase):
                     ib = next(i for i, p in enumerate(state) if p == b)
                     state[ia], state[ib] = state[ib], state[ia]
                 self.assertEqual(state, list(range(n)))
+
+
+class TestColorPlan(unittest.TestCase):
+    def test_no_color_ranges_all_bw(self):
+        result = build_color_plan(8, 4, [], 30, 10)
+        self.assertEqual(result["booklet_count"], 1)
+        self.assertEqual(result["total_sheets"], 2)
+        self.assertEqual(result["color_sheet_count"], 0)
+        self.assertEqual(result["total_cost"], 20)
+        modes = [s["print_mode"] for s in result["booklets"][0]["sheets"]]
+        self.assertEqual(modes, ["bw", "bw"])
+
+    def test_color_sheet_detection_single_booklet(self):
+        # 单价相同 -> 单册（4 张纸）最优；彩色 1–4 页落在最外两张纸上
+        result = build_color_plan(16, 4, [(1, 4)], 10, 10)
+        self.assertEqual(result["booklet_count"], 1)
+        self.assertEqual(result["total_cost"], 40)
+        self.assertEqual(result["color_sheet_count"], 2)
+        modes = [s["print_mode"] for s in result["booklets"][0]["sheets"]]
+        self.assertEqual(modes, ["color", "color", "bw", "bw"])
+
+    def test_split_to_isolate_color_range(self):
+        # 彩印更贵时，把彩色 1–4 页单独成册（1 张彩印纸）比整册混印更省
+        result = build_color_plan(16, 4, [(1, 4)], 30, 10)
+        self.assertEqual(result["total_cost"], 60)
+        self.assertEqual(result["color_sheet_count"], 1)
+        self.assertEqual(
+            [(b["start_page"], b["end_page"]) for b in result["booklets"]],
+            [(1, 4), (5, 16)],
+        )
+        self.assertEqual([b["cost"] for b in result["booklets"]], [30, 30])
+
+    def test_overlapping_ranges_not_double_counted(self):
+        merged = build_color_plan(12, 2, [(9, 12)], 100, 10)
+        overlapped = build_color_plan(12, 2, [(9, 11), (11, 12)], 100, 10)
+        self.assertEqual(overlapped["total_cost"], merged["total_cost"])
+        self.assertEqual(overlapped["total_cost"], 120)
+        self.assertEqual(overlapped["color_sheet_count"], 1)
+
+    def test_split_isolates_color_pages(self):
+        # 12 页、容量 8 页：彩色 9–12 页单独成册（1 张彩印纸）最省
+        result = build_color_plan(12, 2, [(9, 12)], 100, 10)
+        self.assertEqual(result["total_cost"], 120)
+        self.assertEqual(result["total_sheets"], 3)
+        self.assertEqual(
+            [(b["start_page"], b["end_page"]) for b in result["booklets"]],
+            [(1, 8), (9, 12)],
+        )
+        self.assertEqual([b["cost"] for b in result["booklets"]], [20, 100])
+        first, second = result["booklets"]
+        self.assertEqual([s["print_mode"] for s in first["sheets"]], ["bw", "bw"])
+        self.assertEqual([s["print_mode"] for s in second["sheets"]], ["color"])
+        # 页码为全局原稿页码
+        self.assertEqual(second["sheets"][0]["front"], {"left": 12, "right": 9})
+        self.assertEqual(second["sheets"][0]["back"], {"left": 10, "right": 11})
+
+    def test_tie_breaks_by_sheets_booklets_then_end_pages(self):
+        # 9 页、容量 8 页、彩色第 1 页：所有合法方案费用同为 120、均为 3 张纸，
+        # 最少 2 册；末页序列 (1, 9) 字典序最小
+        result = build_color_plan(9, 2, [(1, 1)], 100, 10)
+        self.assertEqual(result["total_cost"], 120)
+        self.assertEqual(result["total_sheets"], 3)
+        self.assertEqual(result["booklet_count"], 2)
+        self.assertEqual(
+            [(b["start_page"], b["end_page"]) for b in result["booklets"]],
+            [(1, 1), (2, 9)],
+        )
+
+    def test_equal_prices_minimize_sheets_then_booklets(self):
+        # 单价相同 -> 总纸张数最少（3 张）、册数最少（2 册）、末页序列最小 (2, 10)
+        result = build_color_plan(10, 2, [], 15, 15)
+        self.assertEqual(result["total_cost"], 45)
+        self.assertEqual(result["total_sheets"], 3)
+        self.assertEqual(result["booklet_count"], 2)
+        self.assertEqual(
+            [(b["start_page"], b["end_page"]) for b in result["booklets"]],
+            [(1, 2), (3, 10)],
+        )
+
+    def test_blank_pages_do_not_trigger_color(self):
+        # 5 页补齐到 8 页；仅第 5 页彩色 -> 仅最内侧纸彩印，补白页不参与判定
+        result = build_color_plan(5, 10, [(5, 5)], 30, 10)
+        self.assertEqual(result["booklet_count"], 1)
+        booklet = result["booklets"][0]
+        self.assertEqual(booklet["blank_pages"], 3)
+        self.assertEqual(
+            [s["print_mode"] for s in booklet["sheets"]], ["bw", "color"]
+        )
+        self.assertEqual(result["total_cost"], 40)
+
+    def test_split_color_plan_booklets_ranges(self):
+        booklets = split_color_plan_booklets(12, 2, [(9, 12)], 100, 10)
+        self.assertEqual(
+            [(b.start_page, b.end_page) for b in booklets], [(1, 8), (9, 12)]
+        )
+        self.assertEqual([b.index for b in booklets], [0, 1])
+        self.assertEqual(booklets[0].sheet_count, 2)
+        self.assertEqual(booklets[1].sheet_count, 1)
+
+    def test_single_page_booklet(self):
+        result = build_color_plan(1, 1, [(1, 1)], 50, 10)
+        self.assertEqual(result["booklet_count"], 1)
+        self.assertEqual(result["total_sheets"], 1)
+        self.assertEqual(result["total_cost"], 50)
+        sheet = result["booklets"][0]["sheets"][0]
+        self.assertEqual(sheet["print_mode"], "color")
+        self.assertEqual(sheet["front"], {"left": None, "right": 1})
 
 
 if __name__ == "__main__":

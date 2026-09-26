@@ -754,5 +754,193 @@ class TestManualDuplexEndpoint(unittest.TestCase):
         self.assertIn("布尔值", body["details"][0]["message"])
 
 
+class TestColorPlanEndpoint(unittest.TestCase):
+    URL = "/api/v1/color-plan"
+
+    VALID = {
+        "total_pages": 12,
+        "max_sheets_per_booklet": 2,
+        "color_ranges": [{"start_page": 9, "end_page": 12}],
+        "color_price_per_sheet": 100,
+        "bw_price_per_sheet": 10,
+    }
+
+    def test_valid_color_plan(self):
+        resp = client.post(self.URL, json=self.VALID)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["total_cost"], 120)
+        self.assertEqual(data["booklet_count"], 2)
+        self.assertEqual(data["total_sheets"], 3)
+        self.assertEqual(data["color_sheet_count"], 1)
+        self.assertEqual(data["color_price_per_sheet"], 100)
+        self.assertEqual(data["bw_price_per_sheet"], 10)
+        self.assertEqual(
+            data["color_ranges"], [{"start_page": 9, "end_page": 12}]
+        )
+
+        first, second = data["booklets"]
+        self.assertEqual((first["start_page"], first["end_page"]), (1, 8))
+        self.assertEqual(first["cost"], 20)
+        self.assertEqual(first["color_sheet_count"], 0)
+        self.assertEqual(
+            [s["print_mode"] for s in first["sheets"]], ["bw", "bw"]
+        )
+        self.assertEqual(first["sheets"][0]["front"], {"left": 8, "right": 1})
+
+        self.assertEqual((second["start_page"], second["end_page"]), (9, 12))
+        self.assertEqual(second["cost"], 100)
+        self.assertEqual(second["color_sheet_count"], 1)
+        self.assertEqual([s["print_mode"] for s in second["sheets"]], ["color"])
+        self.assertEqual(second["sheets"][0]["front"], {"left": 12, "right": 9})
+        self.assertEqual(second["sheets"][0]["back"], {"left": 10, "right": 11})
+
+    def test_color_ranges_optional(self):
+        for variant in ({}, {"color_ranges": None}, {"color_ranges": []}):
+            payload = {
+                "total_pages": 8,
+                "max_sheets_per_booklet": 4,
+                "color_price_per_sheet": 30,
+                "bw_price_per_sheet": 10,
+                **variant,
+            }
+            with self.subTest(payload=payload):
+                resp = client.post(self.URL, json=payload)
+                self.assertEqual(resp.status_code, 200, resp.text)
+                data = resp.json()
+                self.assertEqual(data["total_cost"], 20)
+                self.assertEqual(data["color_sheet_count"], 0)
+                self.assertEqual(data["color_ranges"], [])
+                modes = [
+                    s["print_mode"] for s in data["booklets"][0]["sheets"]
+                ]
+                self.assertEqual(modes, ["bw", "bw"])
+
+    def test_overlapping_ranges_not_double_counted(self):
+        payload = {
+            **self.VALID,
+            "color_ranges": [
+                {"start_page": 9, "end_page": 11},
+                {"start_page": 11, "end_page": 12},
+            ],
+        }
+        resp = client.post(self.URL, json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["total_cost"], 120)
+        self.assertEqual(data["color_sheet_count"], 1)
+
+    def test_blank_pages_stay_bw(self):
+        resp = client.post(
+            self.URL,
+            json={
+                "total_pages": 5,
+                "max_sheets_per_booklet": 10,
+                "color_ranges": [{"start_page": 5, "end_page": 5}],
+                "color_price_per_sheet": 30,
+                "bw_price_per_sheet": 10,
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        booklet = resp.json()["booklets"][0]
+        self.assertEqual(booklet["blank_pages"], 3)
+        self.assertEqual(
+            [s["print_mode"] for s in booklet["sheets"]], ["bw", "color"]
+        )
+        self.assertIsNone(booklet["sheets"][0]["front"]["left"])
+
+    def test_total_pages_upper_bound(self):
+        resp = client.post(
+            self.URL,
+            json={
+                "total_pages": 200,
+                "max_sheets_per_booklet": 1,
+                "color_price_per_sheet": 5,
+                "bw_price_per_sheet": 3,
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["booklet_count"], 50)
+        self.assertEqual(data["total_cost"], 50 * 3)
+
+        resp = client.post(
+            self.URL,
+            json={
+                "total_pages": 201,
+                "max_sheets_per_booklet": 1,
+                "color_price_per_sheet": 5,
+                "bw_price_per_sheet": 3,
+            },
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["error"], "invalid_input")
+
+    def test_reversed_range_rejected(self):
+        resp = client.post(
+            self.URL,
+            json={
+                **self.VALID,
+                "color_ranges": [{"start_page": 5, "end_page": 3}],
+            },
+        )
+        self.assertEqual(resp.status_code, 400)
+        body = resp.json()
+        self.assertEqual(body["error"], "invalid_input")
+        self.assertTrue(any("倒置" in d["message"] for d in body["details"]))
+
+    def test_out_of_bounds_range_rejected(self):
+        resp = client.post(
+            self.URL,
+            json={
+                **self.VALID,
+                "color_ranges": [{"start_page": 11, "end_page": 13}],
+            },
+        )
+        self.assertEqual(resp.status_code, 400)
+        body = resp.json()
+        self.assertTrue(any("越界" in d["message"] for d in body["details"]))
+
+    def test_invalid_payloads_rejected(self):
+        cases = [
+            {},  # 空请求体
+            {"total_pages": 12},  # 缺少必填参数
+            {**self.VALID, "total_pages": 0},  # 总页数非正
+            {**self.VALID, "total_pages": -3},  # 负数
+            {**self.VALID, "total_pages": 201},  # 超过 200 上限
+            {**self.VALID, "total_pages": 12.5},  # 小数
+            {**self.VALID, "total_pages": 12.0},  # 整数浮点
+            {**self.VALID, "total_pages": "12"},  # 数字字符串
+            {**self.VALID, "total_pages": True},  # 布尔值
+            {**self.VALID, "total_pages": None},  # null
+            {**self.VALID, "max_sheets_per_booklet": 0},  # 每册纸张数非正
+            {**self.VALID, "max_sheets_per_booklet": 2.5},  # 小数
+            {**self.VALID, "max_sheets_per_booklet": True},  # 布尔值
+            {**self.VALID, "color_price_per_sheet": 0},  # 彩印单价非正
+            {**self.VALID, "color_price_per_sheet": -100},  # 负单价
+            {**self.VALID, "color_price_per_sheet": 100.0},  # 整数浮点
+            {**self.VALID, "color_price_per_sheet": "100"},  # 数字字符串
+            {**self.VALID, "color_price_per_sheet": True},  # 布尔值
+            {**self.VALID, "bw_price_per_sheet": 0},  # 黑白单价非正
+            {**self.VALID, "bw_price_per_sheet": 1.5},  # 小数单价
+            {**self.VALID, "bw_price_per_sheet": None},  # null 单价
+            {**self.VALID, "color_ranges": "9-12"},  # 区间列表非数组
+            {**self.VALID, "color_ranges": [[9, 12]]},  # 区间项非对象
+            {**self.VALID, "color_ranges": [{"start_page": 0, "end_page": 4}]},  # 端点非正
+            {**self.VALID, "color_ranges": [{"start_page": 9}]},  # 区间缺端点
+            {**self.VALID, "color_ranges": [
+                {"start_page": 9, "end_page": 12, "note": "x"}
+            ]},  # 区间多余字段
+            {**self.VALID, "extra": 1},  # 顶层多余字段
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                resp = client.post(self.URL, json=payload)
+                self.assertEqual(resp.status_code, 400, payload)
+                body = resp.json()
+                self.assertEqual(body["error"], "invalid_input")
+                self.assertIn("details", body)
+
+
 if __name__ == "__main__":
     unittest.main()

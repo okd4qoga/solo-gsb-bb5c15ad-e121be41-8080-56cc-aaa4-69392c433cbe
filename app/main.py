@@ -11,6 +11,7 @@ from .imposition import (
     ChapterTooLargeError,
     build_binding_check,
     build_chapter_imposition,
+    build_color_plan,
     build_imposition,
     build_manual_duplex,
     build_reprint,
@@ -20,6 +21,8 @@ from .schemas import (
     BindingCheckResponse,
     ChapterImpositionRequest,
     ChapterImpositionResponse,
+    ColorPlanRequest,
+    ColorPlanResponse,
     ImpositionRequest,
     ImpositionResponse,
     ManualDuplexRequest,
@@ -35,9 +38,11 @@ app = FastAPI(
         "返回每张纸正反面各自的左、右页码；补位页以 null（空白）表示。"
         "亦支持按章节分册：章节不可拆分、仅相邻章节可合册，"
         "在所有合法分册方案中依次最小化总纸张数与册数；"
-        "还可生成每册独立的两轮手工双面打印清单（倒序回填、短边/长边翻转）。"
+        "还可生成每册独立的两轮手工双面打印清单（倒序回填、短边/长边翻转）；"
+        "并可按彩印 / 黑白每张纸单价求总费用最小的分册方案：纸上任一非空页"
+        "落入彩色区间即整纸彩印，交叠区间不重复计费。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -76,14 +81,20 @@ def _format_validation_errors(errors: list[dict], path: str = "") -> list[dict]:
                 message = "必须为大于等于 0 的非负整数。"
             else:
                 message = "必须为大于等于 1 的正整数。"
+        elif err_type in {"less_than_equal", "le"}:
+            message = "必须为 1 到 200 之间的整数。"
         elif err_type == "extra_forbidden":
             message = "存在不支持的多余字段。"
         elif err_type in {"model_type", "model_attributes_type"}:
             raw_loc = err.get("loc", ())
             if len(raw_loc) >= 2 and "damaged_ranges" in raw_loc:
                 message = "受损页区间列表的每一项都必须是含 start_page、end_page 的对象。"
+            elif len(raw_loc) >= 2 and "color_ranges" in raw_loc:
+                message = "彩色页区间列表的每一项都必须是含 start_page、end_page 的对象。"
             elif field == "damaged_ranges":
                 message = "damaged_ranges 必须是区间对象组成的列表。"
+            elif field == "color_ranges":
+                message = "color_ranges 必须是区间对象组成的列表（可为空或缺省）。"
             else:
                 message = "每一张纸都必须是含 front、back 的对象，且两面各自包含 left、right。"
         elif err_type == "list_type":
@@ -91,6 +102,8 @@ def _format_validation_errors(errors: list[dict], path: str = "") -> list[dict]:
                 message = "chapter_pages 必须是由正整数页数组成的数组。"
             elif field == "sheets":
                 message = "sheets 必须是纸张对象组成的非空列表。"
+            elif field == "color_ranges":
+                message = "color_ranges 必须是区间对象组成的列表（可为空或缺省）。"
             else:
                 message = "damaged_ranges 必须是区间对象组成的非空列表。"
         elif err_type in {"too_short", "string_too_short"}:
@@ -113,7 +126,14 @@ async def validation_exception_handler(
 ) -> JSONResponse:
     """类型 / 范围 / 区间错误统一返回 HTTP 400 与明确错误信息。"""
     path = request.url.path
-    if path.startswith("/api/v1/chapter-impose"):
+    if path.startswith("/api/v1/color-plan"):
+        message = (
+            "输入参数校验失败：total_pages 必须是 1 到 200 之间的整数，"
+            "max_sheets_per_booklet、color_price_per_sheet、bw_price_per_sheet "
+            "必须是正整数，color_ranges 必须是有效的彩色页区间列表"
+            "（可缺省，区间不得倒置或越界）。"
+        )
+    elif path.startswith("/api/v1/chapter-impose"):
         message = (
             "输入参数校验失败：chapter_pages 必须为非空的正整数页数数组，"
             "max_sheets_per_booklet 必须是正整数，"
@@ -160,6 +180,7 @@ async def root() -> dict:
         "chapter_impose_endpoint": "/api/v1/chapter-impose",
         "binding_check_endpoint": "/api/v1/binding-check",
         "manual_duplex_endpoint": "/api/v1/manual-duplex",
+        "color_plan_endpoint": "/api/v1/color-plan",
     }
 
 
@@ -282,6 +303,26 @@ async def binding_check(payload: BindingCheckRequest) -> BindingCheckResponse:
             },
         )
     return BindingCheckResponse.model_validate(result)
+
+
+@app.post(
+    "/api/v1/color-plan",
+    response_model=ColorPlanResponse,
+    tags=["color-plan"],
+    summary="彩印 / 黑白混合计费下总费用最小的分册方案",
+)
+async def color_plan(payload: ColorPlanRequest) -> ColorPlanResponse:
+    result = build_color_plan(
+        total_pages=payload.total_pages,
+        max_sheets_per_booklet=payload.max_sheets_per_booklet,
+        color_ranges=[
+            (item.start_page, item.end_page)
+            for item in payload.color_ranges or []
+        ],
+        color_price_per_sheet=payload.color_price_per_sheet,
+        bw_price_per_sheet=payload.bw_price_per_sheet,
+    )
+    return ColorPlanResponse.model_validate(result)
 
 
 @app.post(
